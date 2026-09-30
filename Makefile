@@ -1,8 +1,8 @@
 CC = clang
 CFLAGS = -Wall -Wextra -Wpedantic -std=c23 -g
 
-TARGET = cerver
-SRC = src/main.c
+TARGET = CEPBEP
+SRC = src/main.c src/http.c
 OBJ = $(SRC:.c=.o)
 
 all: $(TARGET)

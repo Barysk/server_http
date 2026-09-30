@@ -1,3 +1,4 @@
+#include <stddef.h>
 #define _POSIX_C_SOURCE 200809L
 #include <errno.h>
 #include <limits.h>
@@ -11,6 +12,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include "http.h"
 
 #define DEFAULT_PORT 8080
 #define BACKLOG 16
@@ -336,30 +338,41 @@ ssize_t receive_request(int client_fd, char *buffer, size_t buffer_size) {
 	return (ssize_t)used;
 }
 
-int handle_request(int client_fd, char *request) {
-	char method[16];
-	char target[PATH_MAX];
-	char version[16];
+int handle_request(int client_fd, char *buffer, size_t length) {
+	struct http_request request;
 
-	int fields = sscanf(request, "%15s %4095s %15s", method, target, version);
+	enum http_parse_result result = http_parse_request(buffer, length, &request);
 
-	if (fields != 3) {
-		send_error(client_fd, 400, "Bad Request", "Could not parse the HTTP request.");
+	if (result != HTTP_PARSE_OK) {
+		const char *message = "Malformed HTTP request.";
+
+		if (result == HTTP_PARSE_INCOMPLETE) {
+			message = "Incomplete HTTP request.";
+		} else if (result == HTTP_PARSE_TOO_MANY_HEADERS) {
+			message = "Too many HTTP headers.";
+		}
+
+		send_error(client_fd, 400, "Bad Request", message);
 		return -1;
 	}
 
-	printf("%s %s %s\n", method, target, version);
+	printf("%s %s %s\n", request.method, request.target, request.version);
 
-	if (strcmp(method, "GET") != 0) {
+	for (size_t i = 0; i < request.header_count; i++) {
+		printf("  %s: %s\n", request.headers[i].name, request.headers[i].value);
+	}
+
+	printf("Body length: %zu\n", request.body_length);
+
+	/* currently only support GET. */
+	if (strcmp(request.method, "GET") != 0) {
 		send_error(client_fd, 405, "Method Not Allowed", "Only GET is supported right now.");
 		return -1;
 	}
 
-	if (strncmp(target, "/", 1) != 0) {
-		send_error(client_fd, 400, "Bad Request", "The request target must start with '/'.");
-		return -1;
-	}
+	char *target = request.target;
 
+	/* Removing query string from the filesystem path. */
 	char *query = strchr(target, '?');
 
 	if (query != NULL) {
@@ -392,13 +405,13 @@ int handle_request(int client_fd, char *request) {
 	struct stat info;
 
 	if (stat(file_path, &info) == 0 && S_ISDIR(info.st_mode)) {
-		size_t length = strlen(file_path);
+		size_t path_length = strlen(file_path);
 
-		if (length + strlen("/index.html") >= sizeof(file_path)) {
+		if (path_length + strlen("/index.html") >= sizeof(file_path)) {
 			send_error(client_fd, 414, "URI Too Long", "The requested path is too long.");
 			return -1;
 		}
-		memcpy(file_path + length, "/index.html", strlen("/index.html") + 1);
+		strcat(file_path, "/index.html");
 	}
 	return send_file(client_fd, file_path);
 }
@@ -493,7 +506,7 @@ int main(int argc, char** argv) {
 			continue;
 		}
 
-		handle_request(client_fd, request);
+		handle_request(client_fd, request, (size_t)received);
 
 		close(client_fd);
 		printf("Client disconnected.\n");
