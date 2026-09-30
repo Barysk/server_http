@@ -39,4 +39,6 @@ const char *http_header_get(const struct http_request *request, const char *name
 
 int http_get_content_length_from_headers(const char *buffer, size_t header_length, size_t *length);
 
+int http_get_content_length(const struct http_request *request, size_t *length);
+
 #endif

@@ -1,6 +1,7 @@
 #include "http.h"
 
 #include <ctype.h>
+#include <stdint.h>
 #include <string.h>
 #include <strings.h>
 
@@ -159,4 +160,125 @@ const char *http_header_get(const struct http_request *request, const char *name
 		}
 	}
 	return NULL;
+}
+
+int http_get_content_length_from_headers(const char *buffer, size_t header_length, size_t *length) {
+	*length = 0;
+
+	const char *current = buffer;
+
+	/* skipping request line */
+	const char *request_line_end = strstr(current, "\r\n");
+
+	if (request_line_end == NULL || (size_t)(request_line_end - buffer) >= header_length) {
+		return -1;
+	}
+
+	current = request_line_end + 2;
+
+	int found = 0;
+
+	while ((size_t)(current - buffer) < header_length - 2) {
+		const char *line_end = strstr(current, "\r\n");
+
+		if (line_end == NULL || (size_t)(line_end - buffer) >= header_length) {
+			return -1;
+		}
+
+		/* Empty line means the headers are finished. */
+		if (line_end == current) {
+			break;
+		}
+
+		const char *colon = strchr(current, ':');
+
+		if (colon == NULL || colon >= line_end) {
+			return -1;
+		}
+
+		size_t name_length = (size_t)(colon - current);
+
+		if (name_length == strlen("Content-Length") && strncasecmp(current, "Content-Length", name_length) == 0) {
+			if (found) {
+				return -1;
+			}
+
+			found = 1;
+
+			const char *value = colon + 1;
+
+			while (value < line_end && (*value == ' ' || *value == '\t')) {
+				value++;
+			}
+
+			if (value == line_end) {
+				return -1;
+			}
+
+			size_t parsed = 0;
+
+			while (value < line_end) {
+				if (*value < '0' || *value > '9') {
+					return -1;
+				}
+
+				size_t digit = (size_t)(*value - '0');
+
+				if (parsed > (SIZE_MAX - digit) / 10) {
+					return -1;
+				}
+
+				parsed = parsed * 10 + digit;
+				value++;
+			}
+			*length = parsed;
+		}
+		current = line_end + 2;
+	}
+	return 0;
+}
+
+int http_get_content_length(const struct http_request *request, size_t *length) {
+	int found = 0;
+	size_t result = 0;
+
+	for (size_t i = 0; i < request->header_count; i++) {
+		if (strcasecmp(request->headers[i].name,"Content-Length") != 0) {
+			continue;
+		}
+
+		if (found) {
+			return -1;
+		}
+
+		found = 1;
+
+		const char *value = request->headers[i].value;
+
+		if (*value == '\0') {
+			return -1;
+		}
+
+		size_t parsed = 0;
+
+		for (; *value != '\0'; value++) {
+			if (*value < '0' || *value > '9') {
+				return -1;
+			}
+
+			size_t digit = (size_t)(*value - '0');
+
+			if (parsed > (SIZE_MAX - digit) / 10) {
+				return -1;
+			}
+
+			parsed = parsed * 10 + digit;
+		}
+
+		result = parsed;
+	}
+
+	*length = result;
+
+	return 0;
 }

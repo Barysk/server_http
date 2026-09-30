@@ -308,11 +308,32 @@ int send_file(int client_fd, const char *path) {
 	return 0;
 }
 
-ssize_t receive_request(int client_fd, char *buffer, size_t buffer_size) {
-	size_t used = 0;
+int find_header_end(const char *buffer, size_t length, size_t *header_length) {
+	if (length < 4) {
+		return 0;
+	}
 
-	while (used < buffer_size - 1) {
-		ssize_t received = recv(client_fd, buffer + used, buffer_size - 1 - used, 0);
+	for (size_t i = 0; i <= length - 4; i++) {
+		if (memcmp(buffer + i, "\r\n\r\n", 4) == 0) {
+			/* four bytes of "\r\n\r\n" */
+			*header_length = i + 4;
+			return 1;
+		}
+	}
+
+	return 0;
+}
+
+int receive_headers(int client_fd, char *buffer, size_t capacity, size_t *length, size_t *header_length) {
+	*length = 0;
+	*header_length = 0;
+
+	for (;;) {
+		if (*length >= capacity - 1) {
+			return -2;
+		}
+
+		ssize_t received = recv(client_fd, buffer + *length, capacity - 1 - *length, 0);
 
 		if (received < 0) {
 			if (errno == EINTR) {
@@ -322,20 +343,49 @@ ssize_t receive_request(int client_fd, char *buffer, size_t buffer_size) {
 		}
 
 		if (received == 0) {
-			break;
+			return -3;
 		}
 
-		used += (size_t)received;
-		buffer[used] = '\0';
+		*length += (size_t)received;
 
-		if (strstr(buffer, "\r\n\r\n") != NULL) {
-			break;
+		if (find_header_end(buffer, *length, header_length)) {
+			buffer[*length] = '\0';
+			return 0;
 		}
 	}
+}
 
-	buffer[used] = '\0';
+int receive_body(int client_fd, char *buffer, size_t capacity, size_t *length, size_t header_length, size_t body_length) {
+	if (body_length > capacity - 1 - header_length) {
+		return -2;
+	}
 
-	return (ssize_t)used;
+	size_t expected_length = header_length + body_length;
+
+	/* NOTE: the first recv() may already have contained some or all of the body.
+	 * this server doesn't support multiple requests on one connection. */
+	if (*length > expected_length) {
+		return -4;
+	}
+
+	while (*length < expected_length) {
+		ssize_t received = recv(client_fd, buffer + *length, expected_length - *length, 0);
+
+		if (received < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+			return -1;
+		}
+
+		if (received == 0) {
+			/* Client closed the connection before sending the complete body. */
+			return -3;
+		}
+		*length += (size_t)received;
+	}
+	buffer[*length] = '\0';
+	return 0;
 }
 
 int handle_request(int client_fd, char *buffer, size_t length) {
@@ -495,18 +545,71 @@ int main(int argc, char** argv) {
 
 		printf("Client connected.\n");
 
-		/* read request */
 		char request[REQUEST_BUFFER];
 
-		ssize_t received = receive_request(client_fd, request, sizeof(request));
+		size_t request_length;
+		size_t header_length;
 
-		if (received < 0) {
+		int result = receive_headers(client_fd, request, sizeof(request), &request_length, &header_length);
+
+		if (result == -1) {
 			perror("recv");
 			close(client_fd);
 			continue;
 		}
 
-		handle_request(client_fd, request, (size_t)received);
+		if (result == -2) {
+			send_error(client_fd, 431, "Request Header Fields Too Large", "The HTTP headers are too large.");
+			close(client_fd);
+			continue;
+		}
+
+		if (result == -3) {
+			close(client_fd);
+			continue;
+		}
+
+		size_t content_length;
+
+		if (http_get_content_length_from_headers(request, header_length, &content_length) != 0) {
+			send_error(client_fd, 400, "Bad Request", "Invalid Content-Length.");
+			close(client_fd);
+			continue;
+		}
+
+		if (content_length > sizeof(request) - 1 - header_length) {
+			send_error(client_fd, 413, "Payload Too Large", "The request body is too large.");
+			close(client_fd);
+			continue;
+		}
+
+		result = receive_body(client_fd, request, sizeof(request), &request_length, header_length, content_length);
+
+		if (result == -1) {
+			perror("recv");
+			close(client_fd);
+			continue;
+		}
+
+		if (result == -2) {
+			send_error(client_fd, 413, "Payload Too Large", "The request body is too large.");
+			close(client_fd);
+			continue;
+		}
+
+		if (result == -3) {
+			send_error(client_fd, 400, "Bad Request", "The request body was incomplete.");
+			close(client_fd);
+			continue;
+		}
+
+		if (result == -4) {
+			send_error(client_fd, 400, "Bad Request", "Extra data was received after the request body.");
+			close(client_fd);
+			continue;
+		}
+
+		handle_request(client_fd, request, request_length);
 
 		close(client_fd);
 		printf("Client disconnected.\n");
