@@ -1,7 +1,7 @@
 #include <stddef.h>
-#define _POSIX_C_SOURCE 200809L
 #include <errno.h>
 #include <limits.h>
+#include <time.h>
 #include <stdbool.h>
 #include <netinet/in.h>
 #include <signal.h>
@@ -13,6 +13,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include "http.h"
+#include "router.h"
+#include "static.h"
 
 #define DEFAULT_PORT 8080
 #define BACKLOG 16
@@ -32,158 +34,6 @@ int port_parse (const char *text, int *port) {
 	*port = (int)value;
 
 	return 0;
-}
-
-int send_all(int fd, const char *buffer, size_t length) {
-	size_t sent = 0;
-
-	while (sent < length) {
-		ssize_t n = send(fd, buffer + sent, length - sent, 0);
-
-		if (n < 0) {
-			if (errno == EINTR) {
-				continue;
-			}
-			return -1;
-		}
-
-		if (n == 0) {
-			return -1;
-		}
-
-		sent += (size_t)n;
-	}
-	return 0;
-}
-
-int hex_to_int(char c) {
-	if (c >= '0' && c <= '9') {
-		return c - '0';
-	}
-
-	if (c >= 'a' && c <= 'f') {
-		return c - 'a' + 10;
-	}
-
-	if (c >= 'A' && c <= 'F') {
-		return c - 'A' + 10;
-	}
-
-	return -1;
-}
-
-int url_decode(char *path) {
-	char *src = path;
-	char *dst = path;
-
-	while (*src != '\0') {
-		if (*src == '%') {
-			if (src[1] == '\0' || src[2] == '\0') {
-				return -1;
-			}
-
-			int high = hex_to_int(src[1]);
-			int low = hex_to_int(src[2]);
-
-			if (high < 0 || low < 0) {
-				return -1;
-			}
-
-			char decoded = (char)((high << 4) | low);
-
-			if (decoded == '\0') {
-				return -1;
-			}
-
-			*dst++ = decoded;
-			src += 3;
-			continue;
-		}
-		*dst++ = *src++;
-	}
-	*dst = '\0';
-	return 0;
-}
-
-bool is_safe_path(const char *path) {
-	const char *segment_start = path;
-
-	while (*segment_start != '\0') {
-		if (*segment_start == '\\') {
-			return false;
-		}
-
-		const char *slash = strchr(segment_start, '/');
-
-		size_t length;
-
-		if (slash != NULL) {
-			length = (size_t)(slash - segment_start);
-		} else {
-			length = strlen(segment_start);
-		}
-
-		if (length == 2 && segment_start[0] == '.' && segment_start[1] == '.') {
-			return false;
-		}
-
-		if (slash == NULL) {
-			break;
-		}
-
-		segment_start = slash + 1;
-	}
-	return true;
-}
-
-const char *content_type(const char *path) {
-	const char *extension = strrchr(path, '.');
-
-	if (extension == NULL) {
-		return "application/octet-stream";
-	}
-
-	if (strcmp(extension, ".html") == 0 || strcmp(extension, ".htm") == 0) {
-		return "text/html; charset=utf-8";
-	}
-
-	if (strcmp(extension, ".css") == 0) {
-		return "text/css; charset=utf-8";
-	}
-
-	if (strcmp(extension, ".js") == 0) {
-		return "text/javascript; charset=utf-8";
-	}
-
-	if (strcmp(extension, ".txt") == 0) {
-		return "text/plain; charset=utf-8";
-	}
-
-	if (strcmp(extension, ".json") == 0) {
-		return "application/json";
-	}
-
-	if (strcmp(extension, ".png") == 0) {
-		return "image/png";
-	}
-
-	if (strcmp(extension, ".jpg") == 0 || strcmp(extension, ".jpeg") == 0) {
-		return "image/jpeg";
-	}
-
-	if (strcmp(extension, ".gif") == 0) {
-		return "image/gif";
-	}
-
-	if (strcmp(extension, ".svg") == 0) {
-		return "image/svg+xml";
-	}
-
-	if (strcmp(extension, ".ico") == 0) {
-		return "image/x-icon";
-	}
-
-	return "application/octet-stream";
 }
 
 int send_error(int client_fd, int status_code, const char *status_text, const char *message) {
@@ -231,81 +81,6 @@ int send_error(int client_fd, int status_code, const char *status_text, const ch
 	}
 
 	return send_all(client_fd, body, (size_t)body_length);
-}
-
-int send_file(int client_fd, const char *path) {
-	struct stat file_info;
-
-	if (stat(path, &file_info) == -1) {
-		if (errno == ENOENT) {
-			send_error(client_fd, 404, "Not Found", "The requested file was not found.");
-		} else {
-			send_error(client_fd, 500, "Internal Server Error", "Could not inspect the requested file.");
-		}
-		return -1;
-	}
-
-	if (!S_ISREG(file_info.st_mode)) {
-		send_error(client_fd, 404, "Not Found", "The requested resource is not a regular file.");
-		return -1;
-	}
-
-	FILE *file = fopen(path, "rb");
-
-	if (file == NULL) {
-		send_error(client_fd, 500, "Internal Server Error", "Could not open the requested file.");
-		return -1;
-	}
-
-	char header[1024];
-
-	int header_length = snprintf(
-		header,
-		sizeof(header),
-		"HTTP/1.1 200 OK\r\n"
-		"Content-Type: %s\r\n"
-		"Content-Length: %lld\r\n"
-		"Connection: close\r\n"
-		"\r\n",
-		content_type(path),
-		(long long)file_info.st_size
-	);
-
-	if (header_length < 0 || (size_t)header_length >= sizeof(header)) {
-		fclose(file);
-		return -1;
-	}
-
-	if (send_all(client_fd, header, (size_t)header_length) == -1) {
-		fclose(file);
-		return -1;
-	}
-
-	char buffer[FILE_BUFFER];
-
-	for (;;) {
-		size_t bytes_read = fread(buffer, 1, sizeof(buffer), file);
-
-		if (bytes_read > 0) {
-			if (send_all(client_fd, buffer, bytes_read) == -1) {
-				fclose(file);
-				return -1;
-			}
-		}
-
-		if (bytes_read < sizeof(buffer)) {
-			if (feof(file)) {
-				break;
-			}
-
-			if (ferror(file)) {
-				fclose(file);
-				return -1;
-			}
-		}
-	}
-	fclose(file);
-	return 0;
 }
 
 int find_header_end(const char *buffer, size_t length, size_t *header_length) {
@@ -388,82 +163,58 @@ int receive_body(int client_fd, char *buffer, size_t capacity, size_t *length, s
 	return 0;
 }
 
-int handle_request(int client_fd, char *buffer, size_t length) {
+int handle_request(int client_fd, const struct http_router *router, char *buffer, size_t length) {
 	struct http_request request;
 
-	enum http_parse_result result = http_parse_request(buffer, length, &request);
+	enum http_parse_result parse_result = http_parse_request(buffer, length, &request);
 
-	if (result != HTTP_PARSE_OK) {
-		const char *message = "Malformed HTTP request.";
+	if (parse_result != HTTP_PARSE_OK) {
+		return -1;
+	}
 
-		if (result == HTTP_PARSE_INCOMPLETE) {
-			message = "Incomplete HTTP request.";
-		} else if (result == HTTP_PARSE_TOO_MANY_HEADERS) {
-			message = "Too many HTTP headers.";
+	struct http_response response;
+
+	enum http_router_result route_result = http_router_dispatch(router, &request, &response);
+
+	if (route_result == HTTP_ROUTER_NOT_FOUND) {
+		if (strcmp(request.method, "GET") == 0) {
+			static_file_handler(&request, &response);
+		} else {
+			static const char body[] = "Not Found\n";
+
+			http_response_init(&response, 404, "Not Found");
+			http_response_add_header(&response, "Content-Type", "text/plain; charset=utf-8");
+			http_response_set_body(&response, body, sizeof(body) - 1);
 		}
+	} else if (route_result == HTTP_ROUTER_ERROR) {
+		static const char body[] = "Internal Server Error\n";
 
-		send_error(client_fd, 400, "Bad Request", message);
-		return -1;
+		http_response_init(&response, 500, "Internal Server Error");
+		http_response_add_header(&response, "Content-Type", "text/plain; charset=utf-8");
+		http_response_set_body(&response, body, sizeof(body) - 1);
 	}
 
-	printf("%s %s %s\n", request.method, request.target, request.version);
+	int result = http_response_send(client_fd, &response);
+	http_response_destroy(&response);
+	return result;
+}
 
-	for (size_t i = 0; i < request.header_count; i++) {
-		printf("  %s: %s\n", request.headers[i].name, request.headers[i].value);
-	}
+int route_hello(const struct http_request *request, struct http_response *response) {
+	(void)request;
 
-	printf("Body length: %zu\n", request.body_length);
+	static const char body[] = "{\"message\":\"hello from C\"}\n";
 
-	/* currently only support GET. */
-	if (strcmp(request.method, "GET") != 0) {
-		send_error(client_fd, 405, "Method Not Allowed", "Only GET is supported right now.");
-		return -1;
-	}
+	http_response_init(response, 200, "OK");
+	http_response_add_header(response, "Content-Type", "application/json; charset=utf-8");
+	http_response_set_body(response, body, sizeof(body) - 1);
+	return 0;
+}
 
-	char *target = request.target;
-
-	/* Removing query string from the filesystem path. */
-	char *query = strchr(target, '?');
-
-	if (query != NULL) {
-		*query = '\0';
-	}
-
-	if (url_decode(target) != 0) {
-		send_error(client_fd, 400, "Bad Request", "The URL contains invalid percent encoding.");
-		return -1;
-	}
-
-	if (!is_safe_path(target)) {
-		send_error(client_fd, 403, "Forbidden", "The requested path is not allowed.");
-		return -1;
-	}
-
-	char file_path[PATH_MAX];
-
-	if (strcmp(target, "/") == 0) {
-		snprintf(file_path, sizeof(file_path), "./index.html");
-	} else {
-		int written = snprintf(file_path, sizeof(file_path), ".%s", target);
-
-		if (written < 0 || (size_t)written >= sizeof(file_path)) {
-			send_error(client_fd, 414, "URI Too Long", "The requested path is too long.");
-			return -1;
-		}
-	}
-
-	struct stat info;
-
-	if (stat(file_path, &info) == 0 && S_ISDIR(info.st_mode)) {
-		size_t path_length = strlen(file_path);
-
-		if (path_length + strlen("/index.html") >= sizeof(file_path)) {
-			send_error(client_fd, 414, "URI Too Long", "The requested path is too long.");
-			return -1;
-		}
-		strcat(file_path, "/index.html");
-	}
-	return send_file(client_fd, file_path);
+int route_echo(const struct http_request *request, struct http_response *response) {
+	http_response_init(response, 200, "OK");
+	http_response_add_header(response, "Content-Type", "text/plain; charset=utf-8");
+	http_response_set_body(response, request->body, request->body_length);
+	return 0;
 }
 
 int main(int argc, char** argv) {
@@ -527,8 +278,23 @@ int main(int argc, char** argv) {
 
 	printf("HTTP server listening on http://127.0.0.1:%d\n", port);
 
+	/* Time vars */
+	time_t now;
+	struct tm *t;
+
 	bool should_close = false;
 	while (!should_close) {
+		struct http_router router;
+		http_router_init(&router);
+
+		if (http_router_add(&router, "GET", "/api/hello", route_hello) != 0) {
+			return EXIT_FAILURE;
+		}
+
+		if (http_router_add(&router, "POST", "/api/echo", route_echo) != 0) {
+			return EXIT_FAILURE;
+		}
+
 		struct sockaddr_in client_addr;
 		socklen_t client_len = sizeof(client_addr);
 
@@ -543,7 +309,9 @@ int main(int argc, char** argv) {
 			break;
 		}
 
-		printf("Client connected.\n");
+		now = time(NULL);
+		t = localtime(&now);
+		printf("%04d-%02d-%02d %02d:%02d:%02d -- Client connected\n", t->tm_year + 1900, t->tm_mon + 1, t->tm_mday, t->tm_hour, t->tm_min, t->tm_sec);
 
 		char request[REQUEST_BUFFER];
 
@@ -609,10 +377,13 @@ int main(int argc, char** argv) {
 			continue;
 		}
 
-		handle_request(client_fd, request, request_length);
+		handle_request(client_fd, &router, request, request_length);
 
 		close(client_fd);
-		printf("Client disconnected.\n");
+
+		now = time(NULL);
+		t = localtime(&now);
+		printf("%04d-%02d-%02d %02d:%02d:%02d -- Client disconnected\n", t->tm_year + 1900, t->tm_mon + 1, t->tm_mday, t->tm_hour, t->tm_min, t->tm_sec);
 	}
 	close(server_fd);
 	return EXIT_SUCCESS;
